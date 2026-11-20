@@ -146,10 +146,13 @@ On the client, `conn.send::<M, R>(&msg)` blocks until the reply and returns it a
 A pulse is a small notification that does not block the sender. User codes are `0..=127`; `PulseCode::user(code)` returns `Err(Error::InvalidPulseCode(_))` for anything higher. Send one with `conn.send_pulse(code, value)`. A server receives pulses in `Handler::on_pulse`, whose default ignores them, and matches on `pulse.kind()`:
 
 - `PulseKind::User(code)` for user pulses, with the payload in `pulse.value`.
-- `PulseKind::Disconnect` when a client process's last connection goes away. It needs `ChannelFlags::DISCONNECT` on a plain `Channel`; a `NamedChannel` always has it. `receive` has already released the kernel's server connection.
-- `PulseKind::Unblock`, `ThreadDeath`, `CoidDeath` and `Other(code)` for the other kernel codes.
+- `PulseKind::Disconnect` when a client process's last connection goes away. It needs `ChannelFlags::DISCONNECT` on a plain `Channel`; a `NamedChannel` always has it. `pulse.scoid` says which client: it equals `req.sender().scoid` of that client's requests. `receive` releases the kernel's server connection itself, at once or after the last request still held from that client.
+- `PulseKind::Unblock` when a client waiting for its reply on an `UNBLOCK` channel is signalled or times out. `pulse.rcvid()` is `Some(id)` and equals `req.rcvid()` of the held request it is about.
+- `ThreadDeath`, `CoidDeath` and `Other(code)` for the other kernel codes.
 
-A `Pulse` does not carry the sender's connection, so put an identity in the value. qnx-ipc's watchdog demo sends the client id as the heartbeat value.
+`pulse.value` is the low 32 bits of the pulse value and `pulse.value_long` all 64. `pulse.scoid` names the sending process, not which of its threads or connections sent, so put a finer identity in the value. qnx-ipc's watchdog demo sends the client id as the heartbeat value.
+
+**Deferred replies.** A server may keep a `Request` and go on receiving, as long as each held request has its own `RecvBuf` (a request borrows the buffer it was received into). `Handler::on_message` gets each request by value and `serve` reuses one buffer, so a server that defers replies writes its own loop over `receive`. Answer with `req.reply(&value)`, `req.reply_bytes(&bytes)` or `req.reply_error(errno)`. When an `Unblock` pulse arrives, find the held request whose `rcvid()` matches `pulse.rcvid()` and answer it, for example with `reply_error(ETIMEDOUT)`. If a client process dies while its request is held, answering or dropping that request fails and reaches nobody: on a channel with `DISCONNECT` the library keeps the dead client's server connection until its last held request is dropped, so QNX cannot hand its receive id to the next client. Do not call `ConnectDetach` on a scoid yourself. These entries come from qnx-ipc commit `4fda521`, tested on the QEMU target.
 
 `PulseTimer::periodic(&conn, code, period)` starts a `CLOCK_MONOTONIC` timer that sends a pulse with `code` (value 0) on `conn` every `period`. To get timer pulses on your own channel, connect to it first. The pattern from `demo/watchdog`, adapted to a server that only takes pulses:
 
@@ -203,7 +206,7 @@ Keep the timer in a named binding such as `_timer`, as the demos do. `let _ = Pu
 - Names are non-empty and use only ASCII letters, digits, `-`, `_` and `.`. Anything else fails with `Error::InvalidName` before any kernel call.
 - Attaching a name that is already attached fails with `Error::Os(EEXIST)`. Opening a name nobody has attached fails with `Error::Os(ENOENT)`, so a client that may start before its server retries on `ENOENT`, as `demo/safety-client` does.
 - QNX system messages (kinds up to `0x1FF`) can arrive on a named channel. `receive` and `serve` answer them before the handler sees anything: `_IO_CONNECT` gets `EOK` and the rest get `ENOSYS`.
-- QNX creates the channel with `_NTO_CHF_UNBLOCK`. A client blocked on it that is signalled or times out stays blocked until the server answers, and the server gets a `PulseKind::Unblock` pulse.
+- QNX creates the channel with `_NTO_CHF_UNBLOCK`. A client blocked on it that is signalled or times out stays blocked until the server answers, and the server gets a `PulseKind::Unblock` pulse whose `rcvid()` names the held request (see Deferred replies).
 - A `NamedChannel` also gets `PulseKind::CoidDeath` pulses: one whenever a channel this process holds a connection to is destroyed, with that connection id as the value. A `serve` handler can ignore them in `on_pulse`. (From commit `7ea6e54`.)
 
 ## Resource managers with qnx-resmgr
