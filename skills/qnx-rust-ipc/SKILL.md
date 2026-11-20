@@ -139,6 +139,8 @@ The rules that make a server correct:
 
 On the client, `conn.send::<M, R>(&msg)` blocks until the reply and returns it as `R`. A server error reply comes back as `Err(Error::Os(errno))`; use `err.errno()` to read it. `Connection::to_local(chid)` connects to a channel in the same process and `Connection::to_process(pid, chid)` to one in another process on the same node.
 
+**Timeouts.** `conn.send_timeout::<M, R>(&msg, dur)`, `conn.send_bytes_timeout(kind, &payload, &mut reply, dur)`, `channel.receive_timeout(&mut buf, dur)` and `named.receive_timeout(&mut buf, dur)` give up with `Err(Error::Os(ETIMEDOUT))`; `err.is_timeout()` checks for it. They arm `TimerTimeout` right before the blocking call, so no `unsafe` is needed. A send timeout covers both the wait to be received and the wait for the reply. A zero-duration send fails at once and delivers nothing, even to a server already waiting in receive; a zero-duration receive takes what is already waiting. On a channel with `UNBLOCK`, which every `NamedChannel` has, a client whose message was already received stays blocked past its timeout until the server answers (see Named channels). These entries come from qnx-ipc commit `7ea6e54`, tested on the QEMU target.
+
 ## Pulses and pulse timers
 
 A pulse is a small notification that does not block the sender. User codes are `0..=127`; `PulseCode::user(code)` returns `Err(Error::InvalidPulseCode(_))` for anything higher. Send one with `conn.send_pulse(code, value)`. A server receives pulses in `Handler::on_pulse`, whose default ignores them, and matches on `pulse.kind()`:
@@ -202,6 +204,7 @@ Keep the timer in a named binding such as `_timer`, as the demos do. `let _ = Pu
 - Attaching a name that is already attached fails with `Error::Os(EEXIST)`. Opening a name nobody has attached fails with `Error::Os(ENOENT)`, so a client that may start before its server retries on `ENOENT`, as `demo/safety-client` does.
 - QNX system messages (kinds up to `0x1FF`) can arrive on a named channel. `receive` and `serve` answer them before the handler sees anything: `_IO_CONNECT` gets `EOK` and the rest get `ENOSYS`.
 - QNX creates the channel with `_NTO_CHF_UNBLOCK`. A client blocked on it that is signalled or times out stays blocked until the server answers, and the server gets a `PulseKind::Unblock` pulse.
+- A `NamedChannel` also gets `PulseKind::CoidDeath` pulses: one whenever a channel this process holds a connection to is destroyed, with that connection id as the value. A `serve` handler can ignore them in `on_pulse`. (From commit `7ea6e54`.)
 
 ## Resource managers with qnx-resmgr
 
@@ -298,13 +301,13 @@ Each of these was hit or documented in qnx-ipc. Symptom first, then cause and fi
 - **bindgen stops with `Endian not defined`.** clang does not predefine the macros `qcc` does. `qnx-ipc-sys/build.rs` passes `__QNX__=800`, `__QNXNTO__`, `__unix__`, `__unix`, `__LITTLEENDIAN__` and, on x86_64, `__X86_64__`, with `--target=<triple>` and `--sysroot=$QNX_TARGET`. Copy that list if you write your own bindings.
 - **`scp: ... Resource busy` when tests run back to back.** QNX keeps a program file busy for a moment after its process exits. `tools/qnx-run` copies into a fresh directory per run for this reason; keep that if you adapt it.
 - **Ctrl-C stops `cargo run` but not the program on the target.** A resource manager keeps serving its path. Stop it on the target with `slay <program>`, for example `ssh -i "$QNX_SSH_KEY" -p 2222 root@127.0.0.1 slay hello_device`, which also removes `/dev/hello`.
-- **A `TimerTimeout` armed before `NamedChannel::receive` does not cover the whole call.** It covers only the first internal receive; if that one gets a system message, the next receive is not covered. `Channel::receive`, `Connection::send` and `Connection::send_bytes` make no kernel call before the receive or send, so a timeout armed just before them applies.
+- **Use `receive_timeout` instead of arming `TimerTimeout` by hand before `NamedChannel::receive`.** A hand-armed timeout covers only the first internal receive; if that one gets a system message, the next receive is not covered. `NamedChannel::receive_timeout` re-arms each receive with the time left.
 
 ## Verifying on the target
 
 Claims about IPC behaviour need a run on QNX. Type-checking on Linux is not enough.
 
-- **Tests on the target.** With the environment above and the target reachable, `cargo test --target $QNX_RUST_TARGET` builds every test binary for QNX and the runner executes each one on the target, returning its real exit code. Add `QNX_RUN_WITH_C=1` when tests start the C programs. A test that can block (a send with no reply) should carry its own deadline, as the repo's tests do with `TimerTimeout` called through `qnx-ipc-sys` or a thread that waits with a time limit, so a bug fails the run instead of hanging it.
+- **Tests on the target.** With the environment above and the target reachable, `cargo test --target $QNX_RUST_TARGET` builds every test binary for QNX and the runner executes each one on the target, returning its real exit code. Add `QNX_RUN_WITH_C=1` when tests start the C programs. A test that can block (a send with no reply) should carry its own deadline, with `send_timeout` or `receive_timeout` or a thread that waits with a time limit, so a bug fails the run instead of hanging it.
 - **Everything at once in qnx-ipc.** `tools/test-all.sh` runs lint, docs, the `compile_fail` checks, the C build, every workspace test on the target and the demo check, and writes `docs/test-log.txt` with the QNX and toolchain versions.
 - **Lint and docs on the host.** `clippy` and `rustfmt` are not in QNX's package. Run them from rustup with `RUSTC` unset, for the Linux target: `env -u RUSTC cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings`. This type-checks because the bindings always come from the QNX headers.
 - **`compile_fail` doc examples** cannot run as doctests for QNX. qnx-ipc's `tools/compile-fail.sh` builds each one in a scratch crate for the Linux host and requires the error code named in its comment.
